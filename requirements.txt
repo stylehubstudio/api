@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+numpy
+librosa
+soundfile
+praat-parselmouth
+scipy
+scikit-learn
+joblib
