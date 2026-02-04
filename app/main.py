@@ -49,8 +49,8 @@ def verify_api_key(x_api_key: Optional[str] = Header(None)):
 # ---------------- SCHEMAS ----------------
 class VoiceRequest(BaseModel):
     language: str
-    audio_format: str
-    audio_base64: str
+    audioFormat: str
+    audioBase64: str
 
 
 class VoiceResult(BaseModel):
