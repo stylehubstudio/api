@@ -6,4 +6,3 @@ soundfile
 scipy
 scikit-learn==1.7.2
 joblib
-requests
