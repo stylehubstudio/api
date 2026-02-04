@@ -8,7 +8,7 @@ import joblib
 import numpy as np
 import librosa
 
-from features import extract_features_fast   # FAST MODE
+from app.features import extract_features_fast
 
 
 # ================= CONFIG =================
