@@ -3,8 +3,7 @@ uvicorn
 numpy
 librosa
 soundfile
-praat-parselmouth
 scipy
-scikit-learn
+scikit-learn==1.7.2
 joblib
-python-multipart
+requests
