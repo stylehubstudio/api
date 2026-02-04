@@ -63,6 +63,8 @@ class VoiceResult(BaseModel):
 # ---------------- AUDIO DECODER ----------------
 def decode_audio_base64(audio_b64: str):
     try:
+        # sanitize base64 (hackathon testers often add breaks)
+        audio_b64 = audio_b64.strip().replace("\n", "").replace(" ", "")
         audio_bytes = base64.b64decode(audio_b64)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
@@ -77,10 +79,14 @@ def decode_audio_base64(audio_b64: str):
         )
 
         os.remove(tmp_path)
+
+        if y is None or len(y) == 0:
+            raise ValueError("Empty audio")
+
         return y, sr
 
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid audio_base64 input")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid audioBase64 input: {e}")
 
 
 # ---------------- API ENDPOINT ----------------
@@ -89,9 +95,17 @@ def analyze_voice(
     request: VoiceRequest,
     _: None = Depends(verify_api_key)
 ):
-    y, sr = decode_audio_base64(request.audio_base64)
+    # ✅ USE NEW FIELD NAME
+    y, sr = decode_audio_base64(request.audioBase64)
 
     features = extract_features_fast(y, sr)
+
+    if len(features) != model.n_features_in_:
+        raise HTTPException(
+            status_code=500,
+            detail="Feature mismatch between model and input"
+        )
+
     probs = model.predict_proba([features])[0]
 
     human_prob = float(probs[1])
@@ -112,5 +126,6 @@ def analyze_voice(
 def health():
     return {
         "status": "VoiceAuth AI running",
-        "model_version": MODEL_VERSION
+        "model_version": MODEL_VERSION,
+        "features_expected": model.n_features_in_
     }
