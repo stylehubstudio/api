@@ -15,8 +15,13 @@ from app.features import extract_features_fast
 API_KEY = "VOICEAUTH_AI_2026"
 MODEL_PATH = "models/voice_model.pkl"
 MODEL_VERSION = "1.0-fast"
-MAX_DURATION = 8      # seconds
 AI_THRESHOLD = 0.30
+
+# HARD LIMITS (for hackathon tester)
+MAX_BASE64_LEN = 1_500_000     # ~1.1 MB raw
+MAX_DURATION_SEC = 5.0         # seconds
+TARGET_SR = 16000              # faster decode
+MIN_AUDIO_SEC = 1.0
 # =========================================
 
 
@@ -38,11 +43,16 @@ def warmup():
 
 
 # ---------------- AUTH ----------------
-def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    if x_api_key is None:
-        raise HTTPException(status_code=401, detail="Missing x-api-key")
+def verify_api_key(
+    x_api_key: Optional[str] = Header(None),
+    api_key: Optional[str] = Header(None),
+):
+    key = x_api_key or api_key
 
-    if x_api_key != API_KEY:
+    if key is None:
+        raise HTTPException(status_code=401, detail="Missing API key")
+
+    if key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
 
 
@@ -60,33 +70,45 @@ class VoiceResult(BaseModel):
     model_version: str
 
 
-# ---------------- AUDIO DECODER ----------------
+# ---------------- AUDIO DECODER (FAST & SAFE) ----------------
 def decode_audio_base64(audio_b64: str):
     try:
-        # sanitize base64 (hackathon testers often add breaks)
+        # Sanitize base64 (tester may add spaces/newlines)
         audio_b64 = audio_b64.strip().replace("\n", "").replace(" ", "")
+
+        # 🔥 Fail fast on oversized payloads
+        if len(audio_b64) > MAX_BASE64_LEN:
+            raise HTTPException(
+                status_code=413,
+                detail="Audio too large. Use ≤5 seconds MP3."
+            )
+
         audio_bytes = base64.b64decode(audio_b64)
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
             tmp.write(audio_bytes)
             tmp_path = tmp.name
 
+        # 🔥 FAST decode (resample + duration cap)
         y, sr = librosa.load(
             tmp_path,
-            sr=None,
+            sr=TARGET_SR,
             mono=True,
-            duration=MAX_DURATION
+            offset=0.0,
+            duration=MAX_DURATION_SEC
         )
 
         os.remove(tmp_path)
 
-        if y is None or len(y) == 0:
-            raise ValueError("Empty audio")
+        if y is None or len(y) < int(sr * MIN_AUDIO_SEC):
+            raise HTTPException(status_code=400, detail="Audio too short or silent")
 
         return y, sr
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid audioBase64 input: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid audio input: {e}")
 
 
 # ---------------- API ENDPOINT ----------------
@@ -95,19 +117,21 @@ def analyze_voice(
     request: VoiceRequest,
     _: None = Depends(verify_api_key)
 ):
-    # ✅ USE NEW FIELD NAME
+    # Decode audio
     y, sr = decode_audio_base64(request.audioBase64)
 
+    # FAST feature extraction
     features = extract_features_fast(y, sr)
 
+    # Safety check (prevents 500s)
     if len(features) != model.n_features_in_:
         raise HTTPException(
             status_code=500,
-            detail="Feature mismatch between model and input"
+            detail="Model feature mismatch"
         )
 
+    # Predict
     probs = model.predict_proba([features])[0]
-
     human_prob = float(probs[1])
     ai_prob = float(probs[0])
 
