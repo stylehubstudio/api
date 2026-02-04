@@ -1,43 +1,119 @@
-from fastapi import FastAPI, UploadFile, File
-import shutil
+from fastapi import FastAPI, HTTPException, Header, Depends
+from pydantic import BaseModel, HttpUrl
+from typing import Optional
+import tempfile
+import requests
 import os
-import uuid
+import joblib
+import numpy as np
+import librosa
 
-from app.model import predict_voice
-from app.schemas import VoiceResult
-
-app = FastAPI(title="Human vs AI Voice Detection API")
-
-UPLOAD_DIR = "temp"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+from features import extract_features_fast   # FAST MODE
 
 
+# ================= CONFIG =================
+API_KEY = "VOICEAUTH_AI_2026"
+MODEL_PATH = "models/voice_model.pkl"
+MODEL_VERSION = "1.0-fast"
+MAX_DURATION = 8          # seconds (reduced)
+AI_THRESHOLD = 0.30
+# =========================================
+
+
+# ---------------- APP INIT ----------------
+app = FastAPI(
+    title="VoiceAuth AI",
+    description="Fast biologically inspired human vs AI voice authentication API",
+    version=MODEL_VERSION
+)
+
+# Load model ONCE
+model = joblib.load(MODEL_PATH)
+
+
+# ---------------- WARMUP ----------------
+@app.on_event("startup")
+def warmup():
+    dummy = np.zeros((1, model.n_features_in_))
+    model.predict_proba(dummy)
+
+
+# ---------------- AUTH ----------------
+def verify_api_key(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid Authorization")
+
+    if authorization.replace("Bearer ", "").strip() != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
+
+# ---------------- SCHEMAS ----------------
+class VoiceRequest(BaseModel):
+    audio_url: HttpUrl
+    note: Optional[str] = None
+
+
+class VoiceResult(BaseModel):
+    verdict: str
+    human_probability: float
+    ai_probability: float
+    model_version: str
+
+
+# ---------------- AUDIO FETCH (FAST) ----------------
+def load_audio_from_url(url: str):
+    try:
+        r = requests.get(url, timeout=8)
+        if r.status_code != 200:
+            raise Exception()
+
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        tmp.write(r.content)
+        tmp.close()
+
+        y, sr = librosa.load(
+            tmp.name,
+            sr=None,
+            mono=True,
+            duration=MAX_DURATION
+        )
+
+        os.remove(tmp.name)
+        return y, sr
+
+    except Exception:
+        raise HTTPException(status_code=400, detail="Failed to load audio")
+
+
+# ---------------- API ENDPOINT ----------------
 @app.post("/analyze", response_model=VoiceResult)
-async def analyze_voice(file: UploadFile = File(...)):
+def analyze_voice(
+    request: VoiceRequest,
+    _: None = Depends(verify_api_key)
+):
+    y, sr = load_audio_from_url(request.audio_url)
 
-    # Save uploaded file
-    temp_name = f"{uuid.uuid4()}.wav"
-    temp_path = os.path.join(UPLOAD_DIR, temp_name)
+    # FAST FEATURE EXTRACTION
+    features = extract_features_fast(y, sr)
 
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    probs = model.predict_proba([features])[0]
+    human_prob = float(probs[1])
+    ai_prob = float(probs[0])
 
-    # Predict
-    result = predict_voice(temp_path)
+    verdict = "AI" if human_prob <= AI_THRESHOLD else "HUMAN"
 
-    # Clean up
-    os.remove(temp_path)
+    return {
+        "verdict": verdict,
+        "human_probability": round(human_prob, 3),
+        "ai_probability": round(ai_prob, 3),
+        "model_version": MODEL_VERSION
+    }
 
-    # Verdict logic
-    if result["human_probability"] >= 0.65:
-        verdict = "HUMAN"
-    elif result["human_probability"] <= 0.35:
-        verdict = "AI"
-    else:
-        verdict = "UNCERTAIN"
 
-    return VoiceResult(
-        human_probability=result["human_probability"],
-        ai_probability=result["ai_probability"],
-        verdict=verdict
-    )
+# ---------------- HEALTH ----------------
+@app.get("/")
+def health():
+    return {
+        "status": "VoiceAuth AI running",
+        "model_version": MODEL_VERSION
+    }
