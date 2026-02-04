@@ -1,80 +1,115 @@
 import numpy as np
 import librosa
-import parselmouth
-from parselmouth.praat import call
 from scipy.stats import entropy, pearsonr
 
-SILENCE_THRESHOLD = 0.02
-WINDOW_SEC = 1.0
+
+# ================= UTILITIES =================
+
+def safe_entropy(values, bins=30):
+    hist, _ = np.histogram(values, bins=bins, density=True)
+    return entropy(hist + 1e-8)
 
 
-def get_rms(y):
-    return librosa.feature.rms(y=y)[0]
+def windowed_pitch_energy_coupling(y, sr, window_sec=0.25):
+    """
+    Computes pitch-energy coupling over short windows.
+    Returns mean and variability of coupling.
+    """
+    hop_length = int(window_sec * sr)
+    pitches = librosa.yin(
+        y,
+        fmin=75,
+        fmax=500,
+        sr=sr,
+        hop_length=hop_length
+    )
 
+    rms = librosa.feature.rms(
+        y=y,
+        hop_length=hop_length
+    )[0]
 
-def breath_entropy(rms):
-    hist, _ = np.histogram(rms, bins=30, density=True)
-    return entropy(hist + 1e-6)
+    min_len = min(len(pitches), len(rms))
+    pitches = pitches[:min_len]
+    rms = rms[:min_len]
 
-
-def jitter_value(path):
-    snd = parselmouth.Sound(path)
-    pitch = call(snd, "To Pitch", 0.0, 75, 500)
-    pp = call([snd, pitch], "To PointProcess (cc)")
-
-    if call(pp, "Get number of points") < 10:
-        return 0.0
-
-    return call(pp, "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3)
-
-
-def windowed_coupling(y, sr):
-    hop = int(sr * WINDOW_SEC)
     couplings = []
 
-    for i in range(0, len(y) - hop, hop):
-        chunk = y[i:i + hop]
+    for i in range(min_len):
+        if np.isfinite(pitches[i]) and rms[i] > 1e-6:
+            couplings.append(pitches[i] * rms[i])
 
-        pitch = librosa.yin(chunk, fmin=75, fmax=500, sr=sr)
-        rms = librosa.feature.rms(y=chunk)[0]
+    if len(couplings) < 5:
+        return 0.0, 0.0
 
-        m = min(len(pitch), len(rms))
-        pitch, rms = pitch[:m], rms[:m]
-
-        mask = (~np.isnan(pitch)) & (rms > SILENCE_THRESHOLD)
-        if np.sum(mask) > 5:
-            corr, _ = pearsonr(pitch[mask], rms[mask])
-            couplings.append(abs(corr))
-
-    if len(couplings) < 3:
-        return 0.0, 0.0, 0.0
-
-    hist, _ = np.histogram(couplings, bins=10, density=True)
-    return np.mean(couplings), np.std(couplings), entropy(hist + 1e-6)
+    couplings = np.array(couplings)
+    return float(np.mean(couplings)), float(np.std(couplings))
 
 
-def drift_irregularity(y, sr):
-    pitch = librosa.yin(y, fmin=75, fmax=500, sr=sr)
-    pitch = pitch[~np.isnan(pitch)]
+def pitch_energy_correlation(y, sr):
+    """
+    Correlation between pitch and energy over voiced regions.
+    """
+    pitches = librosa.yin(y, fmin=75, fmax=500, sr=sr)
+    rms = librosa.feature.rms(y=y)[0]
 
-    if len(pitch) < 30:
+    min_len = min(len(pitches), len(rms))
+    pitches = pitches[:min_len]
+    rms = rms[:min_len]
+
+    mask = np.isfinite(pitches) & (rms > 1e-6)
+
+    if np.sum(mask) < 5:
         return 0.0
 
-    curvature = np.diff(np.diff(pitch))
-    return np.std(curvature)
+    if np.std(pitches[mask]) < 1e-6 or np.std(rms[mask]) < 1e-6:
+        return 0.0
+
+    corr, _ = pearsonr(pitches[mask], rms[mask])
+    return abs(float(corr))
 
 
-def extract_features(path):
-    y, sr = librosa.load(path, sr=None, mono=True)
-    rms = get_rms(y)
+def temporal_drift_irregularity(y, sr):
+    """
+    Measures non-smooth timing irregularity in speech.
+    AI tends to be smoother than human speech.
+    """
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
 
-    cm, cs, ce = windowed_coupling(y, sr)
+    if len(onset_env) < 3:
+        return 0.0
+
+    diff = np.diff(onset_env)
+    return float(np.std(diff))
+
+
+# ================= FAST FEATURE SET =================
+
+def extract_features_fast(y, sr):
+    """
+    FAST inference feature set (used in API)
+    - No Praat
+    - No disk I/O
+    - Biologically motivated
+    """
+
+    # Energy envelope
+    rms = librosa.feature.rms(y=y)[0]
+
+    # 1️⃣ Breath / energy entropy
+    breath_entropy = safe_entropy(rms)
+
+    # 2️⃣ Pitch–energy coupling (mean & variability)
+    coupling_mean, coupling_var = windowed_pitch_energy_coupling(y, sr)
+
+    # 3️⃣ Temporal drift irregularity
+    drift = temporal_drift_irregularity(y, sr)
 
     return [
-        jitter_value(path),
-        breath_entropy(rms),
-        cm,
-        cs,
-        ce,
-        drift_irregularity(y, sr)
+        breath_entropy,
+        coupling_mean,
+        coupling_var,
+        drift
     ]
+
+
